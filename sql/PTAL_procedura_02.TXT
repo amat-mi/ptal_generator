@@ -1,0 +1,168 @@
+PROCEDURA PER CALCOLARE IL PTAL
+
+--1. ESTRAPOLA NODI GRAFO--
+
+CREATE TABLE ptal.b00_nodo_grafo AS
+
+SELECT
+  nodo, geom
+FROM
+(SELECT 
+  fgid AS nodo, ST_StartPoint(ST_LineMerge(geom)) AS geom
+FROM 
+  ptal.a00_segments_foot
+
+UNION
+
+SELECT 
+  tgid AS nodo, ST_EndPoint(ST_LineMerge(geom)) AS geom
+FROM 
+  ptal.a00_segments_foot
+) AS a
+WHERE 
+  geom IS NOT NULL
+GROUP BY
+  nodo, geom
+
+
+
+--2.FILTRO 
+
+CREATE TABLE ptal.b01_ptal AS
+SELECT
+  *
+FROM
+  (SELECT 
+    a.nodo, a.fermata, b.route_id, a.tipo, a.distance, ROW_NUMBER() OVER(PARTITION BY a.nodo, b.route_id ORDER BY a.distance ) AS gid
+  FROM 
+    ptal.a05_stops_dist_ft AS a, 
+    ptal.inp_corse AS b
+  WHERE 
+    a.fermata=b.stop_id
+  GROUP BY
+    a.nodo, a.fermata, b.route_id, a.tipo, a.distance
+  ORDER BY b.route_id, a.distance)a
+WHERE
+  a.gid=1 AND a.distance <= 1500
+  
+
+
+--3.CREA TABELLA DI BASE DEL PTAL: CALCOLA TEMPO A PIEDI, TEMPO DI ATTESA, EDF, ACCESSIBILITY_INDEX, ECC..--
+
+CREATE TABLE ptal.b02_ptal AS
+WITH b AS(
+SELECT
+  a.nodo, a.tipo, a.fermata, a.route_id, a.distance, b.n_corse, 
+  a.distance/80 AS walk_time,
+  CASE WHEN a.tipo='sup' THEN (2+ 0.5*(60/CAST(b.n_corse AS float))) ELSE (0.75+ 0.5*(60/CAST(b.n_corse AS float))) END AS swt, 
+  (a.distance/80)+(CASE WHEN a.tipo='sup' THEN (2+ 0.5*(60/CAST(b.n_corse AS float))) ELSE (0.75+ 0.5*(60/CAST(b.n_corse AS float))) END) AS accesso,
+  (30/((a.distance/80)+(CASE WHEN a.tipo='sup' THEN (2+ 0.5*(60/CAST(b.n_corse AS float))) ELSE (0.75+ 0.5*(60/CAST(b.n_corse AS float))) END))) AS edf,
+  b.fascia_oraria
+FROM
+  ptal.b01_ptal AS a,
+  ptal.inp_corse AS b
+WHERE
+  a.fermata=b.stop_id
+  AND a.route_id=b.route_id
+ORDER BY a.nodo, a.route_id, b.fascia_oraria),
+
+c AS(
+SELECT
+  *, ROW_NUMBER() OVER(PARTITION BY b.nodo, b.tipo, b.fascia_oraria ORDER BY b.edf DESC ) AS weight
+FROM
+  b
+ORDER BY b.fascia_oraria, b.nodo, b.tipo, b.route_id)
+
+SELECT 
+  nodo, tipo, fermata, route_id, distance, n_corse, walk_time, swt, accesso, edf, 
+  CASE WHEN weight=1 THEN 1 ELSE 0.5 END AS weight,
+  edf*(CASE WHEN weight=1 THEN 1 ELSE 0.5 END) AS acc_index,
+  fascia_oraria
+FROM
+  c
+
+
+
+--4. CALCOLA PTAL CONSIDERANDO L'ORA CHE SI VUOLE INDAGARE--
+
+CREATE TABLE ptal.b03_ptal AS
+
+WITH a AS (
+SELECT
+  nodo, fascia_oraria,
+  CASE 
+  WHEN tipo='sup' AND distance <=640 THEN acc_index
+  WHEN tipo='mm' AND distance <=960 THEN acc_index
+  WHEN tipo='s' AND distance <=960 THEN acc_index 
+  ELSE -1
+  END AS acc_index
+FROM
+  ptal.b02_ptal
+)
+
+SELECT
+  a.nodo, a.fascia_oraria, SUM(a.acc_index) AS acc_index, b.geom
+FROM
+  a,
+  ptal.b00_nodo_grafo AS b
+WHERE
+  a.nodo=b.nodo
+  AND acc_index<>-1
+GROUP BY
+  a.nodo, a.fascia_oraria, b.geom
+  
+  
+  
+--5. TABELLA RIASSUNTIVA --
+
+CREATE TABLE ptal.b04_ptal AS
+WITH a AS(
+SELECT 
+  nodo, 
+  CASE WHEN fascia_oraria='00' THEN acc_index ELSE 0 END AS fascia_00,
+  CASE WHEN fascia_oraria='01' THEN acc_index ELSE 0 END AS fascia_01,  
+  CASE WHEN fascia_oraria='02' THEN acc_index ELSE 0 END AS fascia_02,
+  CASE WHEN fascia_oraria='03' THEN acc_index ELSE 0 END AS fascia_03,
+  CASE WHEN fascia_oraria='04' THEN acc_index ELSE 0 END AS fascia_04,
+  CASE WHEN fascia_oraria='05' THEN acc_index ELSE 0 END AS fascia_05,
+  CASE WHEN fascia_oraria='06' THEN acc_index ELSE 0 END AS fascia_06,
+  CASE WHEN fascia_oraria='07' THEN acc_index ELSE 0 END AS fascia_07,
+  CASE WHEN fascia_oraria='08' THEN acc_index ELSE 0 END AS fascia_08,
+  CASE WHEN fascia_oraria='09' THEN acc_index ELSE 0 END AS fascia_09,
+  CASE WHEN fascia_oraria='10' THEN acc_index ELSE 0 END AS fascia_10,
+  CASE WHEN fascia_oraria='11' THEN acc_index ELSE 0 END AS fascia_11,
+  CASE WHEN fascia_oraria='12' THEN acc_index ELSE 0 END AS fascia_12,
+  CASE WHEN fascia_oraria='13' THEN acc_index ELSE 0 END AS fascia_13,
+  CASE WHEN fascia_oraria='14' THEN acc_index ELSE 0 END AS fascia_14,
+  CASE WHEN fascia_oraria='15' THEN acc_index ELSE 0 END AS fascia_15,
+  CASE WHEN fascia_oraria='16' THEN acc_index ELSE 0 END AS fascia_16,
+  CASE WHEN fascia_oraria='17' THEN acc_index ELSE 0 END AS fascia_17,
+  CASE WHEN fascia_oraria='18' THEN acc_index ELSE 0 END AS fascia_18,
+  CASE WHEN fascia_oraria='19' THEN acc_index ELSE 0 END AS fascia_19,
+  CASE WHEN fascia_oraria='20' THEN acc_index ELSE 0 END AS fascia_20,
+  CASE WHEN fascia_oraria='21' THEN acc_index ELSE 0 END AS fascia_21,
+  CASE WHEN fascia_oraria='22' THEN acc_index ELSE 0 END AS fascia_22,
+  CASE WHEN fascia_oraria='23' THEN acc_index ELSE 0 END AS fascia_23,  
+  geom
+FROM 
+  ptal.b03_ptal
+)
+
+SELECT
+  nodo,
+  SUM(fascia_00) AS fascia_00, SUM(fascia_01) AS fascia_01,
+  SUM(fascia_02) AS fascia_02, SUM(fascia_03) AS fascia_03,
+  SUM(fascia_04) AS fascia_04, SUM(fascia_05) AS fascia_05,
+  SUM(fascia_06) AS fascia_06, SUM(fascia_07) AS fascia_07,
+  SUM(fascia_08) AS fascia_08, SUM(fascia_09) AS fascia_09,
+  SUM(fascia_10) AS fascia_10, SUM(fascia_11) AS fascia_11,
+  SUM(fascia_12) AS fascia_12, SUM(fascia_13) AS fascia_13,
+  SUM(fascia_14) AS fascia_14, SUM(fascia_15) AS fascia_15,
+  SUM(fascia_16) AS fascia_16, SUM(fascia_17) AS fascia_17,
+  SUM(fascia_18) AS fascia_18, SUM(fascia_19) AS fascia_19,
+  SUM(fascia_20) AS fascia_20, SUM(fascia_21) AS fascia_21,
+  SUM(fascia_22) AS fascia_22, SUM(fascia_23) AS fascia_23,
+  geom
+FROM a
+GROUP BY
+  nodo, geom

@@ -1,0 +1,516 @@
+PROCEDURA PER CALCOLARE LA DISTANZA TRA LE FERMATE 'sup', 's' e 'mm' AI NODI E AI CIVICI CON POP. 
+
+--1. RINOMINA IL NODO DI ORIGINE E DI DESTINAZIONE DELLE WAYS (problema BIGINT per il pgrouting)--
+
+  --raggruppa tutti i nodi esistenti
+CREATE TABLE ptal.a00_segments_foot AS
+WITH a AS(
+(SELECT 
+  fnode_id as node
+FROM 
+  ptal.segments_foot
+GROUP BY
+  fnode_id
+)
+
+UNION 
+
+(SELECT 
+  tnode_id as node
+FROM 
+  ptal.segments_foot
+GROUP BY
+  tnode_id
+)
+),
+
+  --assegna un altro id ai nodi esistenti
+b AS (
+SELECT
+  node, row_number() OVER (ORDER BY a.node) as gid
+FROM a
+)
+
+  --join tra nuovo e vecchio id
+SELECT
+  f.gid, f.way_id, f.direction, f.seq, f.fnode_id, f.tnode_id, f.fnode_idx, f.tnode_idx, 
+  f.fnode_prog, f.tnode_prog, f.length, f.geom, f.fgid, t.tgid
+FROM
+(SELECT 
+  a.gid, a.way_id, a.direction, a.seq, a.fnode_id, a.tnode_id, a.fnode_idx, a.tnode_idx, 
+  a.fnode_prog, a.tnode_prog, a.length, a.geom, b.node, b.gid AS fgid
+FROM 
+  ptal.segments_foot AS a, b
+WHERE
+  b.node=a.fnode_id
+) AS f,
+(SELECT 
+  a.gid, a.way_id, a.direction, a.seq, a.fnode_id, a.tnode_id, a.fnode_idx, a.tnode_idx, 
+  a.fnode_prog, a.tnode_prog, a.length, a.geom, b.node, b.gid AS tgid
+FROM 
+  ptal.segments_foot AS a, b
+WHERE
+  b.node=a.tnode_id
+) AS t
+WHERE
+  f.gid = t.gid
+ORDER BY f.gid;
+
+ALTER TABLE ptal.a00_segments_foot ADD CONSTRAINT serial UNIQUE (gid);
+
+
+
+--2. SNAP DELLE FERMATE SULLE WAY--
+
+CREATE TABLE ptal.a01_ways_stops AS
+
+  --trasforma in geometria le stops
+WITH a AS (
+SELECT 
+  stop_id, ST_Transform(ST_SetSRID(ST_MakePoint(stop_lon,stop_lat), 4326), 3003) as geom
+FROM 
+  ptal.inp_stops
+  ),
+
+  --trova la way sulla quale la fermata deve fare lo snap
+b AS(
+SELECT DISTINCT ON(a.stop_id) a.stop_id AS fermata, b.gid, b.way_id, b.fnode_id, b.tnode_id, b.geom
+FROM
+  ptal.segments_foot AS b
+INNER JOIN
+  a
+ON
+  ST_DWithin(a.geom, b.geom, 500)
+ORDER BY a.stop_id, ST_Distance(b.geom, a.geom)
+)
+
+  --dove si trova la fermata sull'arco
+SELECT 
+  b.fermata, b.gid, b.way_id, b.fnode_id, b.tnode_id, --ST_distance(c.geom, a.geom),
+  ST_Length(b.geom)*ST_LineLocatePoint(ST_GeometryN(b.geom,1), a.geom) AS source,
+  ST_Length(b.geom)-(ST_Length(b.geom)*ST_LineLocatePoint(ST_GeometryN(b.geom,1), a.geom)) AS target, 
+  ST_Length(b.geom) AS length,
+  ST_LineInterpolatePoint(ST_GeometryN(b.geom,1), ST_LineLocatePoint(ST_GeometryN(b.geom,1), a.geom)) AS geom
+FROM 
+  a, b
+WHERE 
+  a.stop_id=b.fermata  
+
+
+
+--3. CREA SERIALE--
+
+ALTER TABLE ptal.a01_ways_stops ADD COLUMN contatore BIGSERIAL PRIMARY KEY
+
+
+
+--4. JOIN TRA TABELLA 1. E 3.; QUESTA E' LA TABELLA DI BASE UTILE PER IL ROUTING!--
+
+CREATE TABLE ptal.a02_ways_stops AS
+SELECT 
+  a.fermata, a.gid, a.way_id, a.fnode_id, a.tnode_id, b.fgid, b.tgid,a.source, a.target, a.length, a.geom, a.contatore
+FROM 
+  ptal.a01_ways_stops AS a,
+  ptal.a00_segments_foot AS b
+WHERE
+  a.gid=b.gid AND a.way_id = b.way_id AND a.fnode_id=CAST(b.fnode_id AS bigint) AND a.tnode_id=CAST(b.tnode_id AS bigint)
+ORDER BY a.fermata
+
+
+
+--5. ASSOCIA I CIVICI ALLE WAY E METTI DISTANZA
+
+CREATE TABLE ptal.a02_ways_civico AS
+
+  --trasforma in geometria i civici
+WITH a AS (
+SELECT 
+  idcivico as civico, ST_SetSRID(ST_MakePoint(x,y), 3003) as geom
+FROM 
+  ptal.pop2013_civici
+),
+
+  --trova la way sulla quale il civico deve fare lo snap
+b AS(
+SELECT DISTINCT ON(a.civico) a.civico, b.gid, b.way_id, b.fnode_id, b.tnode_id, b.geom
+FROM
+  ptal.segments_foot AS b
+INNER JOIN
+  a
+ON
+  ST_DWithin(a.geom, b.geom, 500)
+ORDER BY a.civico, ST_Distance(b.geom, a.geom)
+),
+
+  --dove si trova il civico sull'arco
+c as (
+SELECT 
+  b.civico, b.gid, b.way_id, b.fnode_id, b.tnode_id, --ST_distance(c.geom, a.geom),
+  ST_Length(b.geom)*ST_LineLocatePoint(ST_GeometryN(b.geom,1), a.geom) AS source,
+  ST_Length(b.geom)-(ST_Length(b.geom)*ST_LineLocatePoint(ST_GeometryN(b.geom,1), a.geom)) AS target, 
+  ST_Length(b.geom) AS length,
+  ST_LineInterpolatePoint(ST_GeometryN(b.geom,1), ST_LineLocatePoint(ST_GeometryN(b.geom,1), a.geom)) AS geom
+FROM 
+  a, b
+WHERE 
+  a.civico=b.civico
+ORDER BY civico
+)
+
+  --fai il join con la tabella "a00_segments_foot" per avere il nuovo fgid e tgid. La "with B" poteva anche essere fatta con
+  --la tabella "a00_segments_foot" ma era estremamente più lento (prob. causa seriale)
+SELECT 
+  c.civico, c.gid, c.way_id, c.fnode_id, c.tnode_id, b.fgid, b.tgid, c.source, c.target, c.length, c.geom
+FROM 
+  ptal.a00_segments_foot AS b,
+  c
+WHERE
+  c.gid=b.gid AND c.way_id = b.way_id AND CAST(c.fnode_id AS bigint)=CAST(b.fnode_id AS bigint) AND CAST(c.tnode_id AS bigint)=CAST(b.tnode_id AS bigint)
+ORDER BY c.civico
+
+
+
+--6. CREA UNA TABELLA VUOTA NELLA QUALE SI METTONO LE DISTANZE DALLE FERMATE AI NODI, PARTENDO DALL'FNODE--
+
+CREATE TABLE ptal.a03_stops_fnode
+(
+  start_id character varying(100),
+  way_id character varying(21),
+  seq integer,
+  id1 integer,
+  id2 integer,
+  cost double precision
+)
+
+
+
+--7. CREA UNA TABELLA VUOTA NELLA QUALE SI METTONO LE DISTANZE DALLE FERMATE AI NODI, PARTENDO DALL'TNODE--
+
+CREATE TABLE ptal.a023_stops_tnode
+(
+  start_id character varying(100),
+  way_id character varying(21),
+  seq integer,
+  id1 integer,
+  id2 integer,
+  cost double precision
+)
+
+
+
+--8. POPOLA LA TABELLA 5. CON LE DISTANZE--
+
+DO
+$do$
+DECLARE
+    i bigint;
+BEGIN
+FOR i IN SELECT contatore FROM ptal.a02_ways_stops ORDER BY contatore LOOP 
+   INSERT INTO ptal.a03_stops_fnode (start_id, way_id, seq, id1, id2, cost) -- use col names
+   SELECT
+     (SELECT 
+        a.fermata
+      FROM   
+        ptal.a02_ways_stops AS a
+      WHERE 
+        a.contatore=i)AS start_id,
+    (SELECT 
+        a.way_id
+      FROM   
+        ptal.a02_ways_stops AS a
+      WHERE 
+        a.contatore=i)AS way_id,    
+    seq, id1, id2, (cost + (SELECT a.source FROM ptal.a02_ways_stops AS a WHERE a.contatore=i)) AS distance
+  FROM pgr_drivingdistance('
+   SELECT 
+      gid AS id,
+      fgid::int4 AS source,
+      tgid::int4 AS target,
+      length::float8 AS cost
+    FROM 
+      ptal.a00_segments_foot' ::text, 
+      (SELECT 
+        a.fgid
+      FROM   
+        ptal.a02_ways_stops AS a
+      WHERE 
+        a.contatore=i), 
+      3000::double precision, false, false);
+END LOOP;
+END
+$do$
+
+
+
+--9. POPOLA LA TABELLA 6. CON LE DISTANZE
+
+DO
+$do$
+DECLARE
+    i bigint;
+BEGIN
+FOR i IN SELECT contatore FROM ptal.a02_ways_stops ORDER BY contatore LOOP 
+   INSERT INTO ptal.a03_stops_tnode (start_id, way_id, seq, id1, id2, cost) -- use col names
+   SELECT
+     (SELECT 
+        a.fermata
+      FROM   
+        ptal.a02_ways_stops AS a
+      WHERE 
+        a.contatore=i)AS start_id,
+    (SELECT 
+        a.way_id
+      FROM   
+        ptal.a02_ways_stops AS a
+      WHERE 
+        a.contatore=i)AS way_id,    
+    seq, id1, id2, (cost + (SELECT a.target FROM ptal.a02_ways_stops AS a WHERE a.contatore=i)) AS distance
+  FROM pgr_drivingdistance('
+   SELECT 
+      gid AS id,
+      fgid::int4 AS source,
+      tgid::int4 AS target,
+      length::float8 AS cost
+    FROM 
+      ptal.a00_segments_foot' ::text, 
+      (SELECT 
+        a.tgid
+      FROM   
+        ptal.a02_ways_stops AS a
+      WHERE 
+        a.contatore=i), 
+      3000::double precision, false, false);
+END LOOP;
+END
+$do$
+
+
+--10. RAGGRUPPA E TIRA FUORI LA DISTANZA MINIMA
+
+CREATE TABLE ptal.a04_stops_dist_ft AS
+WITH a AS(
+SELECT start_id, way_id, seq, id1, id2, cost
+FROM ptal.a03_stops_dist_fnode
+
+UNION
+
+SELECT start_id, way_id, seq, id1, id2, cost
+FROM ptal.a03_stops_dist_tnode
+)
+
+SELECT start_id AS fermata, id1 AS nodo, MIN(cost) AS distance 
+FROM a
+GROUP BY start_id, id1
+
+
+
+--11. DISTANZA FERMATA-CIVICO
+
+CREATE TABLE ptal.a04_stops_civico_dist AS
+
+WITH a AS (
+SELECT
+  a.fermata, a.nodo, a.min as distance, b.fgid, b.tgid, b.source, b.target 
+FROM 
+  ptal.a04_stops_dist_ft AS a,
+  ptal.a02_ways_stops AS b
+WHERE 
+  a.fermata=b.fermata
+),
+
+b AS (
+SELECT a.fermata, b.civico, a.distance+b.source as distance
+FROM 
+  a, 
+  ptal.a02_ways_civico AS b
+WHERE 
+  a.nodo=b.fgid AND NOT (a.fgid=b.fgid and a.tgid=b.tgid) AND NOT (a.fgid=b.tgid and a.tgid=b.fgid)
+
+UNION
+
+SELECT a.fermata, b.civico, a.distance+b.target as distance
+FROM 
+  a, 
+  ptal.a02_ways_civico AS b
+WHERE 
+  a.nodo=b.tgid AND NOT (a.fgid=b.fgid and a.tgid=b.tgid) AND NOT (a.fgid=b.tgid and a.tgid=b.fgid)
+
+UNION
+
+SELECT a.fermata, b.civico, abs(a.source-b.source) as distance
+FROM 
+  a, 
+  ptal.a02_ways_civico AS b
+WHERE 
+  a.fgid=b.fgid and a.tgid=b.tgid
+
+UNION
+
+SELECT a.fermata, b.civico, abs(a.source-b.target) as distance
+FROM 
+  a, 
+  ptal.a02_ways_civico AS b
+WHERE 
+  a.fgid=b.tgid and a.tgid=b.fgid
+)
+
+SELECT fermata, civico, min(distance)
+FROM b
+GROUP BY fermata, civico 
+ORDER BY fermata, civico
+
+
+
+--12. TIPO FERMATA DISTANZA
+
+CREATE TABLE ptal.a05_stops_dist_ft AS
+WITH a AS(
+  SELECT stop_id, 
+       CASE WHEN substring (stop_id FROM 1 FOR 1) BETWEEN '0' AND '9' THEN 'sup'
+       WHEN substring (stop_id FROM 1 FOR 2) IN ('S0','S9')  THEN 's'
+       WHEN substring (stop_id FROM 1 FOR 1) BETWEEN 'A' AND 'Z'  THEN 'mm'
+       ELSE 'error' END as t
+  FROM ptal.inp_stops
+)
+
+SELECT b.fermata, a.t AS tipo, b.nodo, b.distance
+FROM 
+  a, 
+  ptal.a04_stops_dist_ft AS b
+WHERE
+  b.fermata=a.stop_id
+
+
+
+--13. FERMATA-CIVICO TIPO
+
+CREATE TABLE ptal.a05_stops_civico_dist AS
+
+WITH a AS(
+  SELECT stop_id, 
+       CASE WHEN substring (stop_id FROM 1 FOR 1) BETWEEN '0' AND '9' THEN 'sup'
+       WHEN substring (stop_id FROM 1 FOR 2) IN ('S0','S9')  THEN 's'
+       WHEN substring (stop_id FROM 1 FOR 1) BETWEEN 'A' AND 'Z'  THEN 'mm'
+       ELSE 'error' END as t
+  FROM ptal.inp_stops
+)
+
+SELECT b.fermata, a.t AS tipo, b.civico, b.min AS distance
+FROM 
+  a, 
+  ptal.a04_stops_civico_dist AS b
+WHERE
+  b.fermata=a.stop_id
+
+
+
+--13. DIST MIN FERMATA-NODO PER TIPO
+
+--sup
+CREATE TABLE a6_stops_dist_sup_ft
+WITH a AS(
+  SELECT nodo, min(distance) AS distance
+  FROM ptal.a05_stops_dist_ft
+  WHERE tipo='sup'
+  GROUP BY
+    nodo
+)
+SELECT a.nodo, a.distance, b.fermata, b.tipo
+FROM 
+  a,
+  ptal.a05_stops_dist_ft AS b
+WHERE 
+  a.nodo=b.nodo AND a.distance=b.distance
+ORDER BY a.nodo
+  
+
+--s
+CREATE TABLE a06_stops_dist_s_ft AS
+WITH a AS(
+  SELECT nodo, min(distance) AS distance
+  FROM ptal.a05_stops_dist_ft
+  WHERE tipo='s' --'mm'
+  GROUP BY
+    nodo
+)
+SELECT a.nodo, a.distance, b.fermata, b.tipo
+FROM 
+  a,
+  ptal.a05_stops_dist_ft AS b
+WHERE 
+  a.nodo=b.nodo AND a.distance=b.distance
+ORDER BY a.nodo
+
+--mm
+CREATE TABLE a06_stops_dist_mm_ft AS
+WITH a AS(
+  SELECT nodo, min(distance) AS distance
+  FROM ptal.a05_stops_dist_ft
+  WHERE tipo='mm'
+  GROUP BY
+    nodo
+)
+SELECT a.nodo, a.distance, b.fermata, b.tipo
+FROM 
+  a,
+  ptal.a05_stops_dist_ft AS b
+WHERE 
+  a.nodo=b.nodo AND a.distance=b.distance
+ORDER BY a.nodo
+
+
+
+--14. DISTANZA MIN FERMATA-CIVICO CON POP
+
+CREATE TABLE ptal.a06_stops_civico_dist_all AS 
+WITH sup AS(
+
+  SELECT a.civico, a.distance, b.fermata, b.tipo
+  FROM 
+   (SELECT civico, min(distance) AS distance
+    FROM ptal.a05_stops_civico_dist
+    WHERE tipo='sup'
+    GROUP BY
+    civico) AS a,
+    ptal.a05_stops_civico_dist AS b
+  WHERE 
+  a.civico=b.civico AND a.distance=b.distance
+),
+
+s AS(
+  SELECT a.civico, a.distance, b.fermata, b.tipo
+  FROM 
+   (SELECT civico, min(distance) AS distance
+    FROM ptal.a05_stops_civico_dist
+    WHERE tipo='s'
+    GROUP BY
+    civico) AS a,
+    ptal.a05_stops_civico_dist AS b
+  WHERE 
+  a.civico=b.civico AND a.distance=b.distance
+),
+
+mm AS(
+  SELECT a.civico, a.distance, b.fermata, b.tipo
+  FROM 
+   (SELECT civico, min(distance) AS distance
+    FROM ptal.a05_stops_civico_dist
+    WHERE tipo='mm'
+    GROUP BY
+    civico) AS a,
+    ptal.a05_stops_civico_dist AS b
+  WHERE 
+  a.civico=b.civico AND a.distance=b.distance
+)
+
+SELECT 
+  civici.idcivico as civico,(civici.totm+civici.totf)AS pop, a.distance AS sup_min_distance, b.distance AS s_min_distance, c.distance AS mm_min_distance, civici.geom
+FROM 
+  ptal.pop2013_civici AS civici 
+  LEFT JOIN sup AS a ON civici.idcivico=a.civico
+  LEFT JOIN s AS b ON civici.idcivico=b.civico
+  LEFT JOIN mm AS c ON civici.idcivico=c.civico
+GROUP BY civici.idcivico, (civici.totm+civici.totf), a.distance, b.distance, c.distance, civici.geom
+ORDER BY civici.idcivico
+
+
